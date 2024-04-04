@@ -7,8 +7,3 @@ def mlc():
         "OAUTH_CLIENT_SECRET"
     )
     return admin_config or main_config
-
-
-def mlc_registration():
-    v = get_config("registration_visibility")
-    return v == "mlc"

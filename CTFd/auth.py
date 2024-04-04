@@ -12,7 +12,6 @@ from CTFd.utils import config, email, get_app_config, get_config
 from CTFd.utils import user as current_user
 from CTFd.utils import validators
 from CTFd.utils.config import is_teams_mode
-from CTFd.utils.config.integrations import mlc_registration
 from CTFd.utils.config.visibility import registration_visible
 from CTFd.utils.crypto import verify_password
 from CTFd.utils.decorators import ratelimit
@@ -23,8 +22,11 @@ from CTFd.utils.modes import TEAMS_MODE
 from CTFd.utils.security.auth import login_user, logout_user
 from CTFd.utils.security.signing import unserialize
 from CTFd.utils.validators import ValidationError
+from CTFd.utils.plugins.oauth import OAuthProvider, OAuthException
 
 auth = Blueprint("auth", __name__)
+
+OAUTH_PROVIDERS: list[OAuthProvider] = []
 
 
 @auth.route("/confirm", methods=["POST", "GET"])
@@ -433,31 +435,11 @@ def login():
 
 @auth.route("/oauth")
 def oauth_login():
-    endpoint = (
-        get_app_config("OAUTH_AUTHORIZATION_ENDPOINT")
-        or get_config("oauth_authorization_endpoint")
-        or "https://auth.majorleaguecyber.org/oauth/authorize"
-    )
-
-    if get_config("user_mode") == "teams":
-        scope = "profile team"
-    else:
-        scope = "profile"
-
-    client_id = get_app_config("OAUTH_CLIENT_ID") or get_config("oauth_client_id")
-
-    if client_id is None:
-        error_for(
-            endpoint="auth.login",
-            message="OAuth Settings not configured. "
-            "Ask your CTF administrator to configure MajorLeagueCyber integration.",
-        )
-        return redirect(url_for("auth.login"))
-
-    redirect_url = "{endpoint}?response_type=code&client_id={client_id}&scope={scope}&state={state}".format(
-        endpoint=endpoint, client_id=client_id, scope=scope, state=session["nonce"]
-    )
-    return redirect(redirect_url)
+    try:
+        return OAUTH_PROVIDERS[0].onLogin()
+    except OAuthException as exception:
+        error_for("auth.login", str(exception))
+        redirect(url_for("auth.login"))
 
 
 @auth.route("/redirect", methods=["GET"])
@@ -470,125 +452,21 @@ def oauth_redirect():
         error_for(endpoint="auth.login", message="OAuth State validation mismatch.")
         return redirect(url_for("auth.login"))
 
-    if oauth_code:
-        url = (
-            get_app_config("OAUTH_TOKEN_ENDPOINT")
-            or get_config("oauth_token_endpoint")
-            or "https://auth.majorleaguecyber.org/oauth/token"
-        )
-
-        client_id = get_app_config("OAUTH_CLIENT_ID") or get_config("oauth_client_id")
-        client_secret = get_app_config("OAUTH_CLIENT_SECRET") or get_config(
-            "oauth_client_secret"
-        )
-        headers = {"content-type": "application/x-www-form-urlencoded"}
-        data = {
-            "code": oauth_code,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": "authorization_code",
-        }
-        token_request = requests.post(url, data=data, headers=headers)
-
-        if token_request.status_code == requests.codes.ok:
-            token = token_request.json()["access_token"]
-            user_url = (
-                get_app_config("OAUTH_API_ENDPOINT")
-                or get_config("oauth_api_endpoint")
-                or "https://api.majorleaguecyber.org/user"
-            )
-
-            headers = {
-                "Authorization": "Bearer " + str(token),
-                "Content-type": "application/json",
-            }
-            api_data = requests.get(url=user_url, headers=headers).json()
-
-            user_id = api_data["id"]
-            user_name = api_data["name"]
-            user_email = api_data["email"]
-
-            user = Users.query.filter_by(email=user_email).first()
-            if user is None:
-                # Respect the user count limit
-                num_users_limit = int(get_config("num_users", default=0))
-                num_users = Users.query.filter_by(banned=False, hidden=False).count()
-                if num_users_limit and num_users >= num_users_limit:
-                    abort(
-                        403,
-                        description=f"Reached the maximum number of users ({num_users_limit}).",
-                    )
-
-                # Check if we are allowing registration before creating users
-                if registration_visible() or mlc_registration():
-                    user = Users(
-                        name=user_name,
-                        email=user_email,
-                        oauth_id=user_id,
-                        verified=True,
-                    )
-                    db.session.add(user)
-                    db.session.commit()
-                else:
-                    log("logins", "[{date}] {ip} - Public registration via MLC blocked")
-                    error_for(
-                        endpoint="auth.login",
-                        message="Public registration is disabled. Please try again later.",
-                    )
-                    return redirect(url_for("auth.login"))
-
-            if get_config("user_mode") == TEAMS_MODE and user.team_id is None:
-                team_id = api_data["team"]["id"]
-                team_name = api_data["team"]["name"]
-
-                team = Teams.query.filter_by(oauth_id=team_id).first()
-                if team is None:
-                    num_teams_limit = int(get_config("num_teams", default=0))
-                    num_teams = Teams.query.filter_by(
-                        banned=False, hidden=False
-                    ).count()
-                    if num_teams_limit and num_teams >= num_teams_limit:
-                        abort(
-                            403,
-                            description=f"Reached the maximum number of teams ({num_teams_limit}). Please join an existing team.",
-                        )
-
-                    team = Teams(name=team_name, oauth_id=team_id, captain_id=user.id)
-                    db.session.add(team)
-                    db.session.commit()
-                    clear_team_session(team_id=team.id)
-
-                team_size_limit = get_config("team_size", default=0)
-                if team_size_limit and len(team.members) >= team_size_limit:
-                    plural = "" if team_size_limit == 1 else "s"
-                    size_error = "Teams are limited to {limit} member{plural}.".format(
-                        limit=team_size_limit, plural=plural
-                    )
-                    error_for(endpoint="auth.login", message=size_error)
-                    return redirect(url_for("auth.login"))
-
-                team.members.append(user)
-                db.session.commit()
-
-            if user.oauth_id is None:
-                user.oauth_id = user_id
-                user.verified = True
-                db.session.commit()
-                clear_user_session(user_id=user.id)
-
-            login_user(user)
-
-            return redirect(url_for("challenges.listing"))
-        else:
-            log("logins", "[{date}] {ip} - OAuth token retrieval failure")
-            error_for(endpoint="auth.login", message="OAuth token retrieval failure.")
-            return redirect(url_for("auth.login"))
-    else:
+    if not oauth_code:
         log("logins", "[{date}] {ip} - Received redirect without OAuth code")
         error_for(
             endpoint="auth.login", message="Received redirect without OAuth code."
         )
         return redirect(url_for("auth.login"))
+    
+    try:
+        user = OAUTH_PROVIDERS[0].onRedirect(oauth_code)
+        login_user(user)
+        redirect(url_for("challenges.listing"))
+    except OAuthException as exception:
+        log("logins", "[{date}] {ip} - " + str(exception))
+        error_for("auth.login", str(exception))
+        redirect(url_for("auth.login"))
 
 
 @auth.route("/logout")
